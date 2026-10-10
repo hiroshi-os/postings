@@ -110,12 +110,20 @@ public final class SegmentReader implements AutoCloseable {
 
   /** Returns a PostingsIterator for the given term, or null if the term is absent. */
   public PostingsIterator postings(String term) throws IOException {
+    return postings(term, 1.0f);
+  }
+
+  /**
+   * Returns a PostingsIterator for the given term scaled by query-time IDF, or null if the term is
+   * absent.
+   */
+  public PostingsIterator postings(String term, float idf) throws IOException {
     TermEntry entry = dictReader.lookup(term);
     if (entry == null) {
       return null;
     }
     return new SegmentPostingsIterator(
-        postChannel, entry.postingsOffset(), entry.maxScore(), liveDocs);
+        postChannel, entry.postingsOffset(), entry.maxScore(), liveDocs, idf);
   }
 
   /** Increments ref count. */

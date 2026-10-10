@@ -135,6 +135,8 @@ public final class IndexWriter implements AutoCloseable {
   public synchronized void addDocument(Document doc) throws IOException {
     // Delete existing document if present
     deleteById(doc.id());
+    // The new document being added must remain live
+    pendingDeletes.remove(doc.id());
 
     ramBuffer.addDocument(doc);
     if (ramBuffer.estimatedRamBytes() >= ramBudgetBytes) {
@@ -142,8 +144,12 @@ public final class IndexWriter implements AutoCloseable {
     }
   }
 
+  // Track pending deletions by external ID for documents in the un-flushed RAM buffer
+  private final Set<String> pendingDeletes = new HashSet<>();
+
   /**
-   * Deletes a document by external id. Marks a bit in the active live-docs of the target segment.
+   * Deletes a document by external id. Marks a bit in the active live-docs of the target segment,
+   * or records pending deletion for documents currently in the RAM buffer.
    */
   public synchronized void deleteById(String id) {
     DocLocation loc = idLocations.remove(id);
@@ -152,6 +158,8 @@ public final class IndexWriter implements AutoCloseable {
       if (ld != null) {
         ld.delete(loc.docId());
       }
+    } else {
+      pendingDeletes.add(id);
     }
   }
 
@@ -167,12 +175,22 @@ public final class IndexWriter implements AutoCloseable {
     int docCount = ramBuffer.numDocs();
     SegmentCommitInfo info = new SegmentCommitInfo(segName, docCount, 0, 0);
     segmentInfos.add(info);
-    activeLiveDocs.put(segName, new LiveDocs(docCount));
+    LiveDocs ld = new LiveDocs(docCount);
+    activeLiveDocs.put(segName, ld);
 
     List<String> docIds = ramBuffer.docIds();
     for (int d = 0; d < docIds.size(); d++) {
-      idLocations.put(docIds.get(d), new DocLocation(segName, d));
+      String id = docIds.get(d);
+      if (pendingDeletes.contains(id)) {
+        ld.delete(d);
+      } else {
+        DocLocation prev = idLocations.put(id, new DocLocation(segName, d));
+        if (prev != null && prev.segmentName().equals(segName)) {
+          ld.delete(prev.docId());
+        }
+      }
     }
+    pendingDeletes.clear();
 
     ramBuffer.clear();
   }

@@ -1,6 +1,7 @@
 package com.postings.core.index;
 
 import com.postings.core.model.Document;
+import com.postings.core.search.PostingsIterator;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -17,6 +18,7 @@ public final class IndexReader implements AutoCloseable {
   private final List<SegmentReader> segmentReaders;
   private final long generation;
   private final int totalDocs;
+  private final int maxDoc;
   private final float avgDocLength;
   private final AtomicInteger refCount = new AtomicInteger(1);
   private volatile boolean closed = false;
@@ -26,11 +28,13 @@ public final class IndexReader implements AutoCloseable {
     this.generation = generation;
 
     int totalLive = 0;
+    int totalMax = 0;
     long totalTokens = 0;
 
     for (SegmentReader sr : readers) {
       LiveDocs live = sr.liveDocs();
       int[] lengths = sr.docLengths();
+      totalMax += sr.maxDoc();
       for (int d = 0; d < sr.maxDoc(); d++) {
         if (live.isLive(d)) {
           totalLive++;
@@ -40,6 +44,7 @@ public final class IndexReader implements AutoCloseable {
     }
 
     this.totalDocs = totalLive;
+    this.maxDoc = totalMax;
     this.avgDocLength = (totalLive > 0) ? ((float) totalTokens / (float) totalLive) : 0.0f;
   }
 
@@ -75,6 +80,10 @@ public final class IndexReader implements AutoCloseable {
     return totalDocs;
   }
 
+  public int maxDoc() {
+    return maxDoc;
+  }
+
   public float avgDocLength() {
     return avgDocLength;
   }
@@ -89,7 +98,17 @@ public final class IndexReader implements AutoCloseable {
     for (SegmentReader sr : segmentReaders) {
       TermEntry entry = sr.dictReader().lookup(term);
       if (entry != null) {
-        df += entry.df();
+        if (!sr.liveDocs().hasDeletions()) {
+          df += entry.df();
+        } else {
+          // Count only live docs matching this term in this segment
+          PostingsIterator it = sr.postings(term);
+          if (it != null) {
+            while (it.nextDoc() != PostingsIterator.NO_MORE_DOCS) {
+              df++;
+            }
+          }
+        }
       }
     }
     return df;

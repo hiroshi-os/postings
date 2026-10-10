@@ -22,7 +22,6 @@ public final class PostingsWriter implements AutoCloseable {
   private final DataOutputStream out;
   private final CRC32 crc;
   private final BM25Scorer scorer;
-  private final float avgDocLen;
   private long currentOffset;
 
   private final int[] blockDeltas = new int[BitPacking.BLOCK_SIZE];
@@ -35,7 +34,6 @@ public final class PostingsWriter implements AutoCloseable {
     CheckedOutputStream cos = new CheckedOutputStream(bos, crc);
     this.out = new DataOutputStream(cos);
     this.scorer = scorer;
-    this.avgDocLen = avgDocLen;
 
     CodecUtil.writeHeader(out, CodecUtil.VERSION_CURRENT);
     this.currentOffset = 8; // magic (4) + version (4)
@@ -74,17 +72,15 @@ public final class PostingsWriter implements AutoCloseable {
       int blockEnd = blockStart + BitPacking.BLOCK_SIZE;
       int lastDocId = docIds[blockEnd - 1];
 
-      float blockMaxImpact = 0.0f;
       int maxDocDelta = 0;
       int maxFreqDelta = 0;
+      int maxDocTf = 1;
 
       for (int i = 0; i < BitPacking.BLOCK_SIZE; i++) {
         int d = docIds[blockStart + i];
         int f = freqs[blockStart + i];
-        int dLen = docLengths[d];
-        float score = scorer.score(f, dLen, avgDocLen, idf);
-        if (score > blockMaxImpact) {
-          blockMaxImpact = score;
+        if (f > maxDocTf) {
+          maxDocTf = f;
         }
 
         int delta;
@@ -105,6 +101,10 @@ public final class PostingsWriter implements AutoCloseable {
           maxFreqDelta = freqDelta;
         }
       }
+
+      float k1 = scorer.params().k1();
+      float bParam = scorer.params().b();
+      float blockMaxImpact = (maxDocTf * (k1 + 1.0f)) / (maxDocTf + k1 * (1.0f - bParam));
 
       if (blockMaxImpact > globalMaxScore) {
         globalMaxScore = blockMaxImpact;
@@ -139,19 +139,17 @@ public final class PostingsWriter implements AutoCloseable {
     if (remainder > 0) {
       int blockStart = docIdx;
       int lastDocId = docIds[size - 1];
-      float blockMaxImpact = 0.0f;
 
       ByteArrayOutputStream baos = new ByteArrayOutputStream(remainder * 10);
       DataOutputStream tailOut = new DataOutputStream(baos);
       tailOut.writeByte((byte) remainder);
 
+      int maxDocTf = 1;
       for (int i = 0; i < remainder; i++) {
         int d = docIds[blockStart + i];
         int f = freqs[blockStart + i];
-        int dLen = docLengths[d];
-        float score = scorer.score(f, dLen, avgDocLen, idf);
-        if (score > blockMaxImpact) {
-          blockMaxImpact = score;
+        if (f > maxDocTf) {
+          maxDocTf = f;
         }
 
         int delta;
@@ -165,6 +163,10 @@ public final class PostingsWriter implements AutoCloseable {
         VInt.writeVInt(tailOut, delta);
         VInt.writeVInt(tailOut, freqDelta);
       }
+
+      float k1 = scorer.params().k1();
+      float bParam = scorer.params().b();
+      float blockMaxImpact = (maxDocTf * (k1 + 1.0f)) / (maxDocTf + k1 * (1.0f - bParam));
 
       if (blockMaxImpact > globalMaxScore) {
         globalMaxScore = blockMaxImpact;

@@ -36,12 +36,15 @@ public final class SegmentPostingsIterator implements PostingsIterator {
 
   private final ByteBuffer headerBuf = ByteBuffer.allocate(16);
 
+  private final float idf;
+
   public SegmentPostingsIterator(
-      FileChannel channel, long postingsOffset, float globalMaxScore, LiveDocs liveDocs)
+      FileChannel channel, long postingsOffset, float globalMaxScore, LiveDocs liveDocs, float idf)
       throws IOException {
     this.channel = channel;
     this.globalMaxScore = globalMaxScore;
     this.liveDocs = liveDocs;
+    this.idf = (idf <= 0.0f) ? 1.0f : idf;
 
     ByteBuffer totalBlocksBuf = ByteBuffer.allocate(4);
     channel.read(totalBlocksBuf, postingsOffset);
@@ -52,9 +55,15 @@ public final class SegmentPostingsIterator implements PostingsIterator {
     loadNextBlockHeader();
   }
 
+  public SegmentPostingsIterator(
+      FileChannel channel, long postingsOffset, float globalMaxScore, LiveDocs liveDocs)
+      throws IOException {
+    this(channel, postingsOffset, globalMaxScore, liveDocs, 1.0f);
+  }
+
   public SegmentPostingsIterator(FileChannel channel, long postingsOffset, float globalMaxScore)
       throws IOException {
-    this(channel, postingsOffset, globalMaxScore, null);
+    this(channel, postingsOffset, globalMaxScore, null, 1.0f);
   }
 
   private boolean loadNextBlockHeader() throws IOException {
@@ -149,7 +158,7 @@ public final class SegmentPostingsIterator implements PostingsIterator {
 
   @Override
   public float blockMaxScore() {
-    return curBlockMaxScore;
+    return curBlockMaxScore * idf;
   }
 
   @Override
@@ -159,7 +168,7 @@ public final class SegmentPostingsIterator implements PostingsIterator {
 
   @Override
   public float maxScore() {
-    return globalMaxScore;
+    return globalMaxScore * idf;
   }
 
   @Override

@@ -8,18 +8,27 @@ import com.postings.core.model.Document;
 import com.postings.core.model.ScoredDoc;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Set;
 
-/** Executes queries against a point-in-time IndexReader snapshot. */
+/**
+ * Executes queries against a point-in-time IndexReader snapshot.
+ *
+ * <p>Supports EXHAUSTIVE, WAND, and Block-Max WAND (BMW) disjunction algorithms, as well as AND
+ * conjunction queries with skip blocks.
+ */
 public final class IndexSearcher {
 
   private final IndexReader reader;
   private final Analyzer analyzer;
   private final BM25Params params;
   private final BM25Scorer scorer;
+
+  private record TermScorer(int termIndex, PostingsIterator it, float idf) {}
 
   public IndexSearcher(IndexReader reader, Analyzer analyzer, BM25Params params) {
     this.reader = reader;
@@ -85,7 +94,7 @@ public final class IndexSearcher {
       List<PostingsIterator> iterators = new ArrayList<>();
       List<Float> termIdfs = new ArrayList<>();
       for (int t = 0; t < terms.length; t++) {
-        PostingsIterator it = sr.postings(terms[t]);
+        PostingsIterator it = sr.postings(terms[t], idfs[t]);
         if (it != null) {
           iterators.add(it);
           termIdfs.add(idfs[t]);
@@ -142,7 +151,6 @@ public final class IndexSearcher {
     long scoredCount = 0;
     float avgdl = reader.avgDocLength();
 
-    // Sort iterators by leading iterator
     PostingsIterator lead = iterators.get(0);
     int target = lead.nextDoc();
 
@@ -233,9 +241,70 @@ public final class IndexSearcher {
       int k,
       PriorityQueue<ScoredDoc> minHeap)
       throws IOException {
-    // For M3, execute exhaustive and track stats; refined to full WAND in M4
-    long scored = searchOrExhaustive(segIdx, sr, iterators, idfs, k, minHeap);
-    return new long[] {scored, 0};
+    long docsScored = 0;
+    float avgdl = reader.avgDocLength();
+
+    List<TermScorer> active = new ArrayList<>();
+    for (int i = 0; i < iterators.size(); i++) {
+      PostingsIterator it = iterators.get(i);
+      if (it.nextDoc() != PostingsIterator.NO_MORE_DOCS) {
+        active.add(new TermScorer(i, it, idfs.get(i)));
+      }
+    }
+
+    float[] termScores = new float[iterators.size()];
+
+    while (!active.isEmpty()) {
+      active.sort(Comparator.comparingInt(ts -> ts.it.docId()));
+
+      float threshold = (minHeap.size() < k) ? 0.0f : minHeap.peek().score();
+
+      float accum = 0.0f;
+      int pivotIdx = -1;
+      for (int i = 0; i < active.size(); i++) {
+        accum += active.get(i).it.maxScore();
+        if (accum > threshold) {
+          pivotIdx = i;
+          break;
+        }
+      }
+
+      if (pivotIdx < 0) {
+        break;
+      }
+
+      int pivotDoc = active.get(pivotIdx).it.docId();
+      if (active.get(0).it.docId() == pivotDoc) {
+        docsScored++;
+        int docLen = sr.docLength(pivotDoc);
+        Arrays.fill(termScores, 0.0f);
+        for (int i = 0; i < active.size(); i++) {
+          TermScorer ts = active.get(i);
+          if (ts.it.docId() == pivotDoc) {
+            termScores[ts.termIndex] = scorer.score(ts.it.freq(), docLen, avgdl, ts.idf);
+            ts.it.nextDoc();
+          }
+        }
+        float score = 0.0f;
+        for (float ts : termScores) {
+          score += ts;
+        }
+        if (score > 0.0f) {
+          collectHit(segIdx, pivotDoc, score, sr, k, minHeap);
+        }
+      } else {
+        active.get(0).it.advance(pivotDoc);
+      }
+
+      // Purge exhausted iterators
+      for (int i = active.size() - 1; i >= 0; i--) {
+        if (active.get(i).it.docId() == PostingsIterator.NO_MORE_DOCS) {
+          active.remove(i);
+        }
+      }
+    }
+
+    return new long[] {docsScored, 0};
   }
 
   private long[] searchOrBmw(
@@ -246,9 +315,99 @@ public final class IndexSearcher {
       int k,
       PriorityQueue<ScoredDoc> minHeap)
       throws IOException {
-    // For M3, execute exhaustive and track stats; refined to full BMW in M4
-    long scored = searchOrExhaustive(segIdx, sr, iterators, idfs, k, minHeap);
-    return new long[] {scored, 0};
+    long docsScored = 0;
+    long blocksSkipped = 0;
+    float avgdl = reader.avgDocLength();
+
+    List<TermScorer> active = new ArrayList<>();
+    for (int i = 0; i < iterators.size(); i++) {
+      PostingsIterator it = iterators.get(i);
+      if (it.nextDoc() != PostingsIterator.NO_MORE_DOCS) {
+        active.add(new TermScorer(i, it, idfs.get(i)));
+      }
+    }
+
+    float[] termScores = new float[iterators.size()];
+
+    while (!active.isEmpty()) {
+      active.sort(Comparator.comparingInt(ts -> ts.it.docId()));
+
+      float threshold = (minHeap.size() < k) ? 0.0f : minHeap.peek().score();
+
+      float accum = 0.0f;
+      int pivotIdx = -1;
+      for (int i = 0; i < active.size(); i++) {
+        accum += active.get(i).it.maxScore();
+        if (accum > threshold) {
+          pivotIdx = i;
+          break;
+        }
+      }
+
+      if (pivotIdx < 0) {
+        break;
+      }
+
+      int pivotDoc = active.get(pivotIdx).it.docId();
+      if (active.get(0).it.docId() == pivotDoc) {
+        // Block-Max evaluation
+        float blockMaxSum = 0.0f;
+        int minBlockLastDoc = Integer.MAX_VALUE;
+        for (int i = 0; i < active.size(); i++) {
+          TermScorer ts = active.get(i);
+          if (ts.it.docId() == pivotDoc) {
+            blockMaxSum += ts.it.blockMaxScore();
+            if (ts.it.blockLastDoc() < minBlockLastDoc) {
+              minBlockLastDoc = ts.it.blockLastDoc();
+            }
+          }
+        }
+
+        if (minHeap.size() == k
+            && blockMaxSum < threshold
+            && minBlockLastDoc != Integer.MAX_VALUE) {
+          // Prune block safely without scoring
+          blocksSkipped++;
+          int nextTarget = minBlockLastDoc + 1;
+          for (int i = 0; i < active.size(); i++) {
+            TermScorer ts = active.get(i);
+            if (ts.it.docId() == pivotDoc) {
+              ts.it.advance(nextTarget);
+            }
+          }
+        } else {
+          // Score pivotDoc
+          docsScored++;
+          int docLen = sr.docLength(pivotDoc);
+          Arrays.fill(termScores, 0.0f);
+          for (int i = 0; i < active.size(); i++) {
+            TermScorer ts = active.get(i);
+            if (ts.it.docId() == pivotDoc) {
+              termScores[ts.termIndex] = scorer.score(ts.it.freq(), docLen, avgdl, ts.idf);
+              ts.it.nextDoc();
+            }
+          }
+          float score = 0.0f;
+          for (float ts : termScores) {
+            score += ts;
+          }
+          if (score > 0.0f) {
+            collectHit(segIdx, pivotDoc, score, sr, k, minHeap);
+          }
+        }
+      } else {
+        active.get(0).it.advance(pivotDoc);
+      }
+
+      // Purge exhausted iterators
+      for (int i = active.size() - 1; i >= 0; i--) {
+        if (active.get(i).it.docId() == PostingsIterator.NO_MORE_DOCS) {
+          active.remove(i);
+        }
+      }
+    }
+
+    return new long[] {docsScored, blocksSkipped};
   }
 
   private void collectHit(
