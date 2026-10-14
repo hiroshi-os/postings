@@ -20,6 +20,7 @@ public final class DictionaryReader implements AutoCloseable {
   private final int numBlocks;
   private final String[] firstTerms;
   private final long[] blockOffsets;
+  private final long indexOffset;
 
   public DictionaryReader(Path file) throws IOException {
     this.channel = FileChannel.open(file, StandardOpenOption.READ);
@@ -44,6 +45,7 @@ public final class DictionaryReader implements AutoCloseable {
     if (numBlocks == 0) {
       this.firstTerms = new String[0];
       this.blockOffsets = new long[0];
+      this.indexOffset = 0;
       return;
     }
 
@@ -52,7 +54,7 @@ public final class DictionaryReader implements AutoCloseable {
     ByteBuffer ptrBuf = ByteBuffer.allocate(8);
     channel.read(ptrBuf, indexPointerOffset);
     ptrBuf.flip();
-    long indexOffset = ptrBuf.getLong();
+    this.indexOffset = ptrBuf.getLong();
 
     int indexByteLength = (int) (indexPointerOffset - indexOffset);
     ByteBuffer indexBuf = ByteBuffer.allocate(indexByteLength);
@@ -157,6 +159,57 @@ public final class DictionaryReader implements AutoCloseable {
     }
 
     return null;
+  }
+
+  @FunctionalInterface
+  public interface TermConsumer {
+    void accept(TermEntry entry) throws IOException;
+  }
+
+  /** Iterates sequentially over all terms in the dictionary in lexicographical order. */
+  public void forEachTerm(TermConsumer consumer) throws IOException {
+    if (numTerms == 0) {
+      return;
+    }
+
+    for (int b = 0; b < numBlocks; b++) {
+      long startOffset = blockOffsets[b];
+      long endOffset = (b + 1 < numBlocks) ? blockOffsets[b + 1] : indexOffset;
+      int blockSize = (int) (endOffset - startOffset);
+      ByteBuffer buf = ByteBuffer.allocate(blockSize);
+      channel.read(buf, startOffset);
+      buf.flip();
+
+      // Term 0 of block
+      int term0Len = VInt.readVInt(buf);
+      byte[] prevBytes = new byte[term0Len];
+      buf.get(prevBytes);
+      int df0 = VInt.readVInt(buf);
+      long offset0 = VInt.readVLong(buf);
+      float maxScore0 = buf.getFloat();
+      String term0 = new String(prevBytes, StandardCharsets.UTF_8);
+      consumer.accept(new TermEntry(term0, df0, offset0, maxScore0));
+
+      int remainingTermsInBlock =
+          Math.min(DictionaryWriter.BLOCK_SIZE, numTerms - (b * DictionaryWriter.BLOCK_SIZE)) - 1;
+
+      for (int i = 0; i < remainingTermsInBlock; i++) {
+        int prefixLen = VInt.readVInt(buf);
+        int suffixLen = VInt.readVInt(buf);
+        byte[] currentBytes = new byte[prefixLen + suffixLen];
+        System.arraycopy(prevBytes, 0, currentBytes, 0, prefixLen);
+        buf.get(currentBytes, prefixLen, suffixLen);
+
+        int df = VInt.readVInt(buf);
+        long offset = VInt.readVLong(buf);
+        float maxScore = buf.getFloat();
+
+        String currentTerm = new String(currentBytes, StandardCharsets.UTF_8);
+        consumer.accept(new TermEntry(currentTerm, df, offset, maxScore));
+
+        prevBytes = currentBytes;
+      }
+    }
   }
 
   @Override

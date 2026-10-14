@@ -18,6 +18,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -41,6 +44,16 @@ public final class IndexWriter implements AutoCloseable {
   private final SegmentInfos segmentInfos;
   private final MemoryIndexBuffer ramBuffer;
   private int segmentCounter = 0;
+
+  private final TieredMergePolicy mergePolicy = new TieredMergePolicy();
+  private final ExecutorService mergeExecutor =
+      Executors.newSingleThreadExecutor(
+          r -> {
+            Thread t = new Thread(r, "postings-merge-thread");
+            t.setDaemon(true);
+            return t;
+          });
+  private final AtomicBoolean mergeInProgress = new AtomicBoolean(false);
 
   // Track (segmentName -> LiveDocs) for segments with pending deletions
   private final Map<String, LiveDocs> activeLiveDocs = new HashMap<>();
@@ -223,7 +236,123 @@ public final class IndexWriter implements AutoCloseable {
     segmentInfos.commit(dir);
 
     cleanupUnreferencedFiles();
+    maybeMerge();
     return segmentInfos.generation();
+  }
+
+  /** Triggers a background merge evaluation according to the tiered merge policy. */
+  public void maybeMerge() {
+    if (mergeInProgress.compareAndSet(false, true)) {
+      var unused =
+          mergeExecutor.submit(
+              () -> {
+                try {
+                  while (true) {
+                    TieredMergePolicy.MergeSpecification spec;
+                    synchronized (this) {
+                      spec = mergePolicy.findMerges(segmentInfos.segments());
+                    }
+                    if (spec == null || spec.segmentsToMerge().isEmpty()) {
+                      break;
+                    }
+                    synchronized (this) {
+                      executeMerge(spec);
+                    }
+                  }
+                } catch (Exception ignored) {
+                  // Best-effort background merge
+                } finally {
+                  mergeInProgress.set(false);
+                }
+              });
+    }
+  }
+
+  /** Forces merging down to at most maxNumSegments. Blocks until all merges complete. */
+  public void forceMerge(int maxNumSegments) throws IOException {
+    while (mergeInProgress.get()) {
+      try {
+        Thread.sleep(10);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IOException("Interrupted during forceMerge", e);
+      }
+    }
+
+    synchronized (this) {
+      commit();
+      while (segmentInfos.size() > maxNumSegments) {
+        TieredMergePolicy.MergeSpecification spec =
+            mergePolicy.findForcedMerges(segmentInfos.segments(), maxNumSegments);
+        if (spec == null || spec.segmentsToMerge().isEmpty()) {
+          break;
+        }
+        executeMerge(spec);
+      }
+    }
+  }
+
+  private void executeMerge(TieredMergePolicy.MergeSpecification spec) throws IOException {
+    List<SegmentCommitInfo> merging = spec.segmentsToMerge();
+    if (merging.isEmpty()) {
+      return;
+    }
+
+    List<SegmentReader> readers = new ArrayList<>(merging.size());
+    for (SegmentCommitInfo info : merging) {
+      readers.add(new SegmentReader(dir, info.segmentName(), info.delGen()));
+    }
+
+    String newSegName = "_" + segmentCounter++;
+    SegmentMerger.MergeResult result;
+    try {
+      result = SegmentMerger.merge(dir, newSegName, readers, scorer);
+    } finally {
+      for (SegmentReader sr : readers) {
+        try {
+          sr.close();
+        } catch (Exception ignored) {
+          // Suppress close exception during merge cleanup
+        }
+      }
+    }
+
+    Set<String> mergedNames = new HashSet<>();
+    for (SegmentCommitInfo info : merging) {
+      mergedNames.add(info.segmentName());
+      activeLiveDocs.remove(info.segmentName());
+    }
+
+    List<SegmentCommitInfo> newSegments = new ArrayList<>();
+    boolean insertedNew = false;
+    for (SegmentCommitInfo info : segmentInfos.segments()) {
+      if (mergedNames.contains(info.segmentName())) {
+        if (!insertedNew && result != null) {
+          newSegments.add(new SegmentCommitInfo(result.segmentName(), result.docCount(), 0, 0));
+          insertedNew = true;
+        }
+      } else {
+        newSegments.add(info);
+      }
+    }
+    if (!insertedNew && result != null) {
+      newSegments.add(new SegmentCommitInfo(result.segmentName(), result.docCount(), 0, 0));
+    }
+
+    if (result != null) {
+      activeLiveDocs.put(result.segmentName(), new LiveDocs(result.docCount()));
+      Path storedPath = dir.resolve(result.segmentName() + ".stored");
+      try (StoredFieldsWriter.Reader storedReader = new StoredFieldsWriter.Reader(storedPath)) {
+        for (int d = 0; d < storedReader.numDocs(); d++) {
+          Document doc = storedReader.get(d);
+          idLocations.put(doc.id(), new DocLocation(result.segmentName(), d));
+        }
+      }
+    }
+
+    segmentInfos.setSegments(newSegments);
+    segmentInfos.commit(dir);
+    cleanupUnreferencedFiles();
   }
 
   public synchronized SegmentInfos segmentInfos() {
@@ -273,6 +402,7 @@ public final class IndexWriter implements AutoCloseable {
     try {
       commit();
     } finally {
+      mergeExecutor.shutdown();
       try {
         fileLock.release();
       } finally {
